@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import socketio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 
 from openharness.ui.runtime import build_runtime, start_runtime, handle_line, close_runtime
 
@@ -23,6 +25,41 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 PROTOCOL_PREFIX = 'OHJSON:'
+WEB_AUTH_TOKEN_ENV = "OPENHARNESS_WEB_AUTH_TOKEN"
+
+
+def _load_web_auth_token(auth_token: str | None = None) -> str | None:
+    """Return the configured web API token, if any."""
+    return auth_token or os.environ.get(WEB_AUTH_TOKEN_ENV)
+
+
+def _is_authorized_web_request(request: Request, token: str | None) -> bool:
+    """Validate bearer-token access for web control-plane requests."""
+    if not token:
+        return True
+
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, value = auth_header.partition(" ")
+    return scheme.lower() == "bearer" and secrets.compare_digest(value, token)
+
+
+def _extract_socket_token(auth: Any) -> str | None:
+    """Extract a bearer token from Socket.IO auth metadata."""
+    if isinstance(auth, dict):
+        token = auth.get("token") or auth.get("access_token")
+        if isinstance(token, str):
+            return token
+        bearer = auth.get("authorization") or auth.get("Authorization")
+        if isinstance(bearer, str):
+            scheme, _, value = bearer.partition(" ")
+            if scheme.lower() == "bearer":
+                return value
+    return None
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return True when a host value is restricted to the local machine."""
+    return host in {"127.0.0.1", "localhost", "::1"}
 
 
 def _get_doctor_summary(runtime_bundle: Any, cwd: str) -> dict[str, Any]:
@@ -533,11 +570,17 @@ class WebBackendHost:
 # Global backend host instance
 backend_host = WebBackendHost()
 
-# Create Socket.IO server
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*', path='/socket.io')
+# Create Socket.IO server. The default Socket.IO CORS policy only allows
+# same-origin requests, which matches the bundled web frontend without exposing
+# the agent control plane to arbitrary browser origins.
+sio = socketio.AsyncServer(async_mode='asgi', path='/socket.io')
 
 # Set the sio on the backend_host
 backend_host.set_sio(sio)
+
+# The active app's bearer token is set by create_app() so Socket.IO handlers can
+# enforce the same control-plane boundary as HTTP API routes.
+_active_web_auth_token: str | None = None
 
 # Global build state tracking for auto-build feature
 _frontend_build_state: dict[str, any] = {
@@ -562,10 +605,25 @@ def create_app(
     api_client: SupportsStreamingMessages | None = None,
     permission_mode: str | None = None,
     frontend_dir: Path | None = None,
+    auth_token: str | None = None,
 ) -> FastAPI:
     """Create FastAPI application for web frontend."""
     
     app = FastAPI(title="OpenHarness Web")
+    web_auth_token = _load_web_auth_token(auth_token)
+    global _active_web_auth_token
+    _active_web_auth_token = web_auth_token
+
+    @app.middleware("http")
+    async def require_web_auth(request: Request, call_next):
+        if request.url.path.startswith("/api/") and request.url.path != "/api/health":
+            if not _is_authorized_web_request(request, web_auth_token):
+                return JSONResponse(
+                    {"detail": "Web API authentication required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return await call_next(request)
     
     # Define API routes first (before catch-all static route)
     @app.get("/api/health")
@@ -730,9 +788,7 @@ def create_app(
     @app.post("/api/import")
     async def import_item(request: Request):
         """Import plugins, tools, prompts, or commands from files or URLs."""
-        import json
         import tempfile
-        import shutil
         from pathlib import Path
         from openharness.config.paths import get_config_dir
         
@@ -881,7 +937,6 @@ def create_app(
     async def get_models():
         """Get list of available models."""
         from openharness.config import load_settings
-        from openharness.api.registry import PROVIDERS
         
         settings = load_settings()
         
@@ -1159,7 +1214,7 @@ def create_app(
     @app.get("/api/memories")
     async def get_memories():
         """Get all memories for the current project."""
-        from openharness.memory import scan_memory_files, get_project_memory_dir
+        from openharness.memory import scan_memory_files
         
         try:
             work_dir = cwd or str(Path.cwd())
@@ -1617,7 +1672,7 @@ type: {memory_type}
             )
             await start_runtime(backend_host.runtime_bundle)
             logger.info("Runtime initialized successfully")
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to initialize runtime")
             raise
     
@@ -1638,6 +1693,12 @@ type: {memory_type}
 @sio.event
 async def connect(sid, environ, auth):
     """Handle new Socket.IO connection."""
+    if _active_web_auth_token:
+        token = _extract_socket_token(auth)
+        if not token or not secrets.compare_digest(token, _active_web_auth_token):
+            logger.warning("Rejected unauthenticated Socket.IO client: %s", sid)
+            raise ConnectionRefusedError("Web Socket.IO authentication required")
+
     logger.info(f"Client connected: {sid}")
     backend_host.clients.add(sid)
     
@@ -1744,7 +1805,7 @@ def _find_available_port(host: str, start_port: int, max_attempts: int = 10) -> 
 
 async def run_web_server(
     *,
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 8080,
     cwd: str | None = None,
     model: str | None = None,
@@ -1755,9 +1816,18 @@ async def run_web_server(
     api_format: str | None = None,
     permission_mode: str | None = None,
     serve_frontend: bool = True,
+    auth_token: str | None = None,
 ) -> None:
     """Run the web server for OpenHarness frontend."""
     import uvicorn
+    web_auth_token = _load_web_auth_token(auth_token)
+    if not _is_loopback_host(host) and not web_auth_token:
+        raise ValueError(
+            f"Refusing to bind OpenHarness web control plane to {host!r} without authentication. "
+            f"Use --auth-token or set {WEB_AUTH_TOKEN_ENV} when exposing the web server."
+        )
+    if web_auth_token:
+        logger.info("Web API bearer-token authentication is enabled")
     
     frontend_dir = None
     if serve_frontend:
@@ -1816,7 +1886,7 @@ async def run_web_server(
                 
         except subprocess.TimeoutExpired:
             logger.error("Frontend build timed out (5 minutes)")
-        except Exception as e:
+        except Exception:
             logger.exception("Frontend build failed")
             
     elif serve_frontend and not frontend_dir:
@@ -1826,7 +1896,6 @@ async def run_web_server(
         )
     
     # Check if port is available, find alternative if needed
-    original_port = port
     if not _is_port_available(host, port):
         logger.warning(f"Port {port} is already in use, finding alternative...")
         try:
@@ -1846,6 +1915,7 @@ async def run_web_server(
         api_format=api_format,
         permission_mode=permission_mode,
         frontend_dir=frontend_dir,
+        auth_token=web_auth_token,
     )
     
     # Combine FastAPI and Socket.IO

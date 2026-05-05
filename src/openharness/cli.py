@@ -1096,7 +1096,7 @@ def provider_remove(
 @app.command("web")
 def web(
     host: str = typer.Option(
-        "0.0.0.0",
+        "127.0.0.1",
         "--host",
         help="Host to bind the web server to",
     ),
@@ -1110,6 +1110,11 @@ def web(
         True,
         "--serve-frontend/--no-serve-frontend",
         help="Serve the web frontend static files",
+    ),
+    auth_token: str | None = typer.Option(
+        None,
+        "--auth-token",
+        help="Bearer token required for web API and Socket.IO clients",
     ),
     # --- Session ---
     cwd: str | None = typer.Option(
@@ -1173,6 +1178,7 @@ def web(
             api_format=api_format,
             permission_mode=permission_mode,
             serve_frontend=serve_frontend,
+            auth_token=auth_token,
         )
     )
 
